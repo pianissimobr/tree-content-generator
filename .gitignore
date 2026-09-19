@@ -1,0 +1,98 @@
+# ============================================================
+# Python
+# ============================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# ============================================================
+# Ambientes virtuais
+# ============================================================
+.venv/
+venv/
+ENV/
+env/
+.venv-tcg/
+.venv*/
+
+# ============================================================
+# Ferramentas de desenvolvimento
+# ============================================================
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
+
+# ============================================================
+# IDEs e editores
+# ============================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+.project
+.classpath
+.settings/
+
+# ============================================================
+# Sistema operacional
+# ============================================================
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ============================================================
+# Saída do gerador
+# ============================================================
+estrutura*.md
+estrutura*_arquivos/
+saida*.md
+saida*_arquivos/
+*.tcg.md
+
+# Exceto o exemplo do repositório
+!exemplos/saida-exemplo.md
+
+# ============================================================
+# Temporários das ferramentas
+# ============================================================
+tcg_*.bin
+tcg_sparse_*.img
+tcg_img_*.img
+
+# ============================================================
+# Logs
+# ============================================================
+*.log
+logs/

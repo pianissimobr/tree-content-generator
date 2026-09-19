@@ -1,0 +1,101 @@
+# ============================================================
+# Tree Content Generator — dependências Python OPCIONAIS
+# ============================================================
+#
+# NENHUMA é obrigatória. O script roda apenas com a biblioteca padrão
+# do Python e, sem nenhuma destas, ainda processa:
+#   • zip, tar, tar.gz, tar.bz2, tar.xz          (nativo)
+#   • gzip, bzip2, xz como streams soltos        (nativo)
+#   • ar e .deb                                  (nativo)
+#   • Android boot image (ANDROID!)              (nativo)
+#   • Android sparse image (via binário simg2img)
+#   • MBR/GPT particionado                       (nativo)
+#   • ext2/3/4 via binário debugfs
+#   • FAT via binário mdir
+#
+# Cada pacote abaixo adiciona suporte a um formato específico.
+# O script detecta em tempo de execução o que está disponível e
+# mostra isso no diagnóstico inicial ("Ferramentas detectadas").
+#
+# Instalação de tudo de uma vez:
+#     pip install -r requirements.txt
+#
+# Instalação de um só:
+#     pip install pycdlib
+#
+# Se você usa ambiente virtual:
+#     python3 -m venv .venv
+#     source .venv/bin/activate
+#     pip install -r requirements.txt
+# ------------------------------------------------------------
+
+
+# ----- Leitura de imagens ISO 9660 (.iso) -----
+# Alternativa pura-Python ao binário isoinfo.
+# Sem ele, o script usa isoinfo se estiver instalado; se nem isso,
+# a árvore do .iso não é mostrada.
+pycdlib>=1.14.0
+
+
+# ----- Descompressão de streams Zstandard (.zst, .tzst) -----
+# Alternativa pura-Python ao binário zstd.
+# Sem ele, .zst/.tzst caem como binário (a menos que o binário zstd
+# esteja no PATH, mas o handler atual só usa a lib Python).
+zstandard>=0.22.0
+
+
+# ----- Leitura de arquivos .7z (pura Python) -----
+# Alternativa pura-Python ao binário 7z/7za.
+# Sem ele, .7z só abre se o binário 7z estiver instalado.
+py7zr>=0.21.0
+
+
+# ----- (Opcional) Detecção automática de encoding -----
+# Melhora a leitura de arquivos de texto em encodings incomuns
+# (ex.: Big5, Shift-JIS, KOI8-R). Se ausente, o script cai no
+# fallback atual: tenta utf-8, latin-1, cp1252, iso-8859-1 em ordem.
+chardet>=5.2.0
+
+
+# ----- (Opcional) Leitura de RAR sem o binário unrar -----
+# ATENÇÃO: rarfile precisa de um backend externo (unrar, unar ou
+# bsdtar) para extrair de fato. Ele só melhora o parsing da lista
+# de membros. Se você não usa .rar com frequência, pode pular.
+# rarfile>=4.1
+
+
+# ============================================================
+# FERRAMENTAS DE SISTEMA (não instaláveis via pip)
+# ============================================================
+#
+# Estes binários ampliam o suporte a formatos. Não são pacotes Python,
+# então NÃO ficam no requirements.txt do pip. Use o script
+# `instalar_opcionais.sh` (Debian/Ubuntu) ou instale manualmente:
+#
+#   Debian/Ubuntu/Mint:
+#     sudo apt install p7zip-full simg2img e2fsprogs mtools \
+#                      genisoimage squashfs-tools file unrar-free
+#
+#   Fedora/RHEL:
+#     sudo dnf install p7zip p7zip-plugins android-tools e2fsprogs \
+#                      mtools genisoimage squashfs-tools file unrar
+#
+#   Arch/Manjaro:
+#     sudo pacman -S p7zip android-tools e2fsprogs mtools cdrtools \
+#                    squashfs-tools file unrar
+#
+# O que cada um habilita:
+#
+#   p7zip-full      → .7z, .rar (via 7z)
+#   simg2img        → Android sparse image (boot.bin, rootfs.bin)
+#   e2fsprogs       → .img com ext2/3/4 (via debugfs)
+#   mtools          → .img com FAT12/16/32 (via mdir)
+#   genisoimage     → .iso (isoinfo); não necessário se usar pycdlib
+#   squashfs-tools  → .squashfs, .sqfs, .sfs
+#   file            → ajuda a detectar .img sem magic reconhecida
+#   unrar-free      → .rar sem depender do 7z
+#
+# Verificação rápida depois de instalar:
+#     python3 -c "import pycdlib, zstandard, py7zr, chardet; print('OK')"
+#     which 7z simg2img debugfs mdir isoinfo unsquashfs file
+# ============================================================
