@@ -20,6 +20,8 @@ Os testes cobrem:
   • escape_md — escapa caracteres especiais de Markdown
   • valid_options — rejeita entradas fora da lista
   • generate_tree_with_content — modos inline e separate
+  • ignore padrão (node_modules), .gitignore e padrões extra
+  • ofuscação de segredos e ocultação de arquivos sensíveis (.env)
 """
 
 import builtins
@@ -276,6 +278,91 @@ def t_generate_inline(mod, tmp):
     assert "b.py" in txt, "b.py não aparece na saída"
 
 
+def t_ignora_pasta_padrao(mod, tmp):
+    """node_modules/ é ignorado por padrão e não é percorrido."""
+    d = tmp / "dir_ignore_padrao"
+    (d / "node_modules" / "lib").mkdir(parents=True)
+    (d / "node_modules" / "lib" / "x.js").write_text("x", encoding="utf-8")
+    (d / "src").mkdir()
+    (d / "src" / "app.py").write_text("print(1)", encoding="utf-8")
+
+    out = tmp / "saida_ignore_padrao.md"
+    ok = mod.generate_tree_with_content(
+        str(d), str(out), archive_mode="skip", output_mode="inline")
+    assert ok is True
+    txt = out.read_text(encoding="utf-8")
+    assert "ignorado" in txt, "node_modules deveria aparecer como ignorado"
+    assert "x.js" not in txt, "conteúdo de node_modules não deveria aparecer"
+    assert "app.py" in txt, "src/app.py deveria ter sido transcrito normalmente"
+
+
+def t_respeita_gitignore(mod, tmp):
+    """Um .gitignore no diretório raiz é respeitado quando pedido."""
+    d = tmp / "dir_gitignore"
+    d.mkdir()
+    (d / ".gitignore").write_text("segredo.txt\n", encoding="utf-8")
+    (d / "segredo.txt").write_text("nao deveria aparecer", encoding="utf-8")
+    (d / "normal.txt").write_text("ok", encoding="utf-8")
+
+    out = tmp / "saida_gitignore.md"
+    ok = mod.generate_tree_only(
+        str(d), str(out), use_default_ignores=False, respect_gitignore=True)
+    assert ok is True
+    txt = out.read_text(encoding="utf-8")
+    assert "segredo.txt" not in txt, "segredo.txt deveria ter sido ignorado"
+    assert "normal.txt" in txt, "normal.txt deveria aparecer normalmente"
+
+
+def t_padrao_extra_ignora(mod, tmp):
+    """extra_ignore_patterns ignora arquivos que batem com o glob informado."""
+    d = tmp / "dir_extra"
+    d.mkdir()
+    (d / "notas.tmp").write_text("descartavel", encoding="utf-8")
+    (d / "app.py").write_text("print(1)", encoding="utf-8")
+
+    out = tmp / "saida_extra.md"
+    ok = mod.generate_tree_only(
+        str(d), str(out), use_default_ignores=False, respect_gitignore=False,
+        extra_ignore_patterns=["*.tmp"])
+    assert ok is True
+    txt = out.read_text(encoding="utf-8")
+    assert "notas.tmp" not in txt, "notas.tmp deveria ter sido ignorado"
+    assert "app.py" in txt
+
+
+def t_ofusca_chave_aws(mod, tmp):
+    """Uma chave AWS hardcoded no código é ofuscada na transcrição."""
+    d = tmp / "dir_segredo"
+    d.mkdir()
+    (d / "config.py").write_text(
+        "API_KEY = 'AKIAABCDEFGHIJKLMNOP'\n", encoding="utf-8")
+
+    out = tmp / "saida_segredo.md"
+    ok = mod.generate_tree_with_content(
+        str(d), str(out), archive_mode="skip", output_mode="inline",
+        redact_secrets=True)
+    assert ok is True
+    txt = out.read_text(encoding="utf-8")
+    assert "AKIAABCDEFGHIJKLMNOP" not in txt, "a chave não deveria aparecer em texto puro"
+    assert "OCULTADO" in txt, "deveria haver um marcador de ofuscação"
+
+
+def t_arquivo_sensivel_oculto(mod, tmp):
+    """Um .env nunca tem o conteúdo transcrito, mesmo sem segredo óbvio."""
+    d = tmp / "dir_env"
+    d.mkdir()
+    (d / ".env").write_text("DB_PASSWORD=supersecreto123\n", encoding="utf-8")
+
+    out = tmp / "saida_env.md"
+    ok = mod.generate_tree_with_content(
+        str(d), str(out), archive_mode="skip", output_mode="inline",
+        include_hidden=True, redact_secrets=True)
+    assert ok is True
+    txt = out.read_text(encoding="utf-8")
+    assert "supersecreto123" not in txt, ".env não deveria ter o conteúdo exposto"
+    assert "sensível" in txt, "deveria haver o aviso de arquivo sensível"
+
+
 def t_generate_separate(mod, tmp):
     """generate_tree_with_content em modo separate cria a pasta de transcrições."""
     d = tmp / "dir_sep"
@@ -319,6 +406,11 @@ TESTES = [
     ("valid_options é estrito",            t_valid_options_estrito),
     ("generate inline funciona",           t_generate_inline),
     ("generate separate cria pasta",       t_generate_separate),
+    ("ignora pasta padrão (node_modules)", t_ignora_pasta_padrao),
+    ("respeita .gitignore",                t_respeita_gitignore),
+    ("padrão extra de ignore funciona",    t_padrao_extra_ignora),
+    ("ofusca chave AWS hardcoded",         t_ofusca_chave_aws),
+    ("arquivo sensível (.env) oculto",     t_arquivo_sensivel_oculto),
 ]
 
 

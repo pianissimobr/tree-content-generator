@@ -31,6 +31,16 @@ IA. Tudo em Python puro, com ferramentas externas opcionais para formatos exóti
   arquivos corrompidos e arquivos grandes
 - 🔍 **Diagnóstico inicial** — mostra quais ferramentas externas estão
   disponíveis antes de rodar
+- ⏭️ **Ignora ruído por padrão** — `node_modules`, `__pycache__`, `.venv`,
+  `dist`, `build`, `.git`, lockfiles e outras pastas/arquivos gerados
+  automaticamente nunca entram na saída (é o que transforma um projeto
+  "montado" de 500 MB–1 GB em 30 MB de código de verdade)
+- 📝 **Respeita o `.gitignore`** do projeto (inclusive os aninhados em
+  subpastas) e aceita padrões extras de exclusão (glob) informados por você
+- 🔒 **Ofusca segredos automaticamente** — chaves de API, tokens, senhas,
+  credenciais em URL e chaves privadas são substituídos por um marcador
+  antes de ir pro `.md`; arquivos como `.env`, `id_rsa` e `*.pem` nunca têm
+  o conteúdo transcrito
 
 ---
 
@@ -58,11 +68,14 @@ O programa é **interativo**. Ele pergunta:
 3. Nome do arquivo de saída
 4. Profundidade máxima da árvore
 5. Incluir arquivos ocultos?
-6. Limite de linhas por arquivo
-7. Transcrever só a raiz ou tudo?
-8. Tamanho máximo por arquivo
-9. **Containers** — ignorar / listar / listar+transcrever, com recursão
-10. Como salvar as transcrições — inline ou separado
+6. **Ignorar pastas/arquivos** — padrão (node_modules, dist, venv, ...),
+   `.gitignore` do projeto (se existir) e padrões extra
+7. Limite de linhas por arquivo
+8. Transcrever só a raiz ou tudo?
+9. Tamanho máximo por arquivo
+10. **Containers** — ignorar / listar / listar+transcrever, com recursão
+11. Como salvar as transcrições — inline ou separado
+12. **Ofuscar segredos** nos arquivos transcritos? (recomendado: sim)
 
 A qualquer momento, digite `sair` para cancelar — nada é escrito antes da
 confirmação final.
@@ -94,6 +107,59 @@ não estiver instalada, o script apenas **ignora aquele arquivo** e continua —
 nunca trava.
 
 📖 Catálogo completo com exemplos: [`docs/FORMATOS.md`](docs/FORMATOS.md)
+
+---
+
+## ⏭️ Ignorando ruído (de 1 GB "montado" pra 30 MB de código)
+
+Um projeto rodando localmente acumula `node_modules/`, `venv/`, caches de
+build, binários compilados — nada disso é código, e nada disso deveria ir
+pra uma análise de IA. Por padrão o gerador já corta isso:
+
+- **Lista própria de pastas/arquivos gerados** — `node_modules`,
+  `__pycache__`, `.venv`/`venv`, `dist`, `build`, `.next`, `target`,
+  `.git`, `coverage`, `.idea`/`.vscode`, lockfiles (`package-lock.json`,
+  `yarn.lock`, `Cargo.lock`, ...) e várias outras. A pasta aparece na árvore
+  como uma linha só, marcada `(ignorado — padrão)`, sem ser percorrida —
+  então um `node_modules` com 50 mil arquivos nem chega a ser listado.
+- **`.gitignore` do projeto** — se existir um `.gitignore` na raiz (ou em
+  subpastas), o gerador oferece respeitá-lo. Suporta o que normalmente se
+  usa num `.gitignore`: comentários, negação (`!arquivo`), âncora
+  (`/pasta`), pastas (`pasta/`), `*`, `**` e `?`. Não é uma reimplementação
+  100% fiel do git — é uma heurística pensada pra esse caso de uso.
+- **Padrões extra** — na hora de gerar, você pode informar padrões
+  adicionais (`*.log, docs/rascunhos`) pra casos específicos do seu projeto.
+
+Tudo isso pode ser desligado (útil se você quer ver exatamente o que o
+`.gitignore` de um projeto está escondendo, por exemplo). Nas funções
+Python, os parâmetros são `use_default_ignores`, `respect_gitignore` e
+`extra_ignore_patterns`.
+
+## 🔒 Ofuscando segredos antes de mandar pra uma IA
+
+Mandar um projeto inteiro pra análise de uma IA de terceiros é exatamente o
+tipo de situação em que uma chave de API esquecida num `config.py` vira um
+vazamento. O modo "árvore + transcrição" ofusca isso por padrão:
+
+- **Arquivos claramente sensíveis nunca são transcritos** — `.env` e
+  variantes, `id_rsa`/`id_ed25519`, `*.pem`, `*.key`, `*.pfx`,
+  `credentials.json`, `service-account.json` e outros aparecem como
+  `🔒 Arquivo sensível — conteúdo não transcrito`, não importa o que tenha
+  dentro.
+- **O resto do texto passa por uma varredura de segredos** — chaves AWS
+  (`AKIA...`), Google API Key, tokens do GitHub/Slack/Stripe, JWT, blocos
+  `-----BEGIN PRIVATE KEY-----`, credenciais em URL (`user:senha@host`),
+  cabeçalho `Authorization: Bearer ...` e atribuições do tipo
+  `SENHA = "..."` / `API_KEY=...` são substituídos por um marcador como
+  `«OCULTADO»` ou `«OCULTADO:AWS-KEY»`, mantendo o resto do arquivo intacto.
+- O rodapé do `.md` mostra quantos segredos foram ofuscados e quantos
+  arquivos sensíveis foram ocultados, pra você confirmar que nada vazou.
+
+⚠️ **É uma heurística por regex, não uma garantia de segurança.** Revise a
+saída antes de enviar pra terceiros, principalmente se o projeto tiver
+segredos em formatos fora do comum. Pode ser desligado com
+`redact_secrets=False` (não recomendado) se você já sabe que não há nada
+sensível no projeto.
 
 ---
 
@@ -310,7 +376,7 @@ tudo trafega via `io.BytesIO`.
 make test
 ~~~
 
-Roda 16 checagens de fumaça que criam arquivos temporários em `/tmp` e validam:
+Roda 21 checagens de fumaça que criam arquivos temporários em `/tmp` e validam:
 
 - Detecção por magic bytes de `zip`, `gzip`, `tar`, `tgz`, `android-boot`
 - `ZipHandler` e `TarHandler` listam e leem corretamente
@@ -320,6 +386,11 @@ Roda 16 checagens de fumaça que criam arquivos temporários em `/tmp` e validam
 - Escape de Markdown funciona
 - `valid_options` rejeita entrada fora da lista
 - Modos `inline` e `separate` geram a saída correta
+- Pastas padrão (`node_modules`) são ignoradas e não percorridas
+- `.gitignore` do projeto é respeitado quando pedido
+- Padrões extra de exclusão funcionam
+- Chave da AWS hardcoded no código é ofuscada na transcrição
+- Arquivo `.env` nunca tem o conteúdo transcrito
 
 Tudo em `/tmp`, apagado no `finally`. Se algum teste falhar, ele é nomeado
 explicitamente.
@@ -388,7 +459,7 @@ ler bytes. Perfeito para o `calibracao.tar` de 100 MB.
 ├── Makefile
 ├── requirements.txt
 ├── instalar_opcionais.sh
-├── geradordepastasearquivos.py    ← arquivo principal (v6)
+├── geradordepastasearquivos.py    ← arquivo principal (v7)
 ├── docs/
 │   ├── FORMATOS.md
 │   └── ARQUITETURA.md

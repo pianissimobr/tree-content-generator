@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """
-Tree Content Generator - Versão Interativa (v6)
+Tree Content Generator - Versão Interativa (v7)
 Gera árvore de diretórios com ou sem transcrição de arquivos para Markdown.
+
+NOVO NA v7 (sobre a v6):
+  • Ignora por padrão pastas/arquivos gerados automaticamente (node_modules,
+    __pycache__, venv, dist, build, .git, lockfiles, etc.) — resolve o caso
+    de um projeto "montado" de 500 MB~1 GB que é, na prática, 30 MB de código
+  • Respeita o .gitignore do projeto (inclusive aninhado em subpastas)
+  • Aceita padrões extras de exclusão informados pelo usuário (estilo glob)
+  • Ofusca segredos óbvios nos arquivos transcritos (chaves de API, tokens,
+    senhas, credenciais em URL, chaves privadas PEM) via heurística de regex
+  • Arquivos claramente sensíveis (.env, id_rsa, *.pem, credentials.json, ...)
+    nunca têm o conteúdo transcrito — aparecem como placeholder "🔒 sensível"
 
 NOVO NA v6 (sobre a v5):
   • AndroidBootHandler     — Android boot image (magic 'ANDROID!')
@@ -38,6 +49,7 @@ import gzip
 import io
 import lzma
 import os
+import re
 import shutil
 import stat
 import struct
@@ -86,6 +98,139 @@ MAX_ARCHIVE_MEMBERS = 5000
 MAX_ARCHIVE_TOTAL_BYTES = 4 * 1024 * 1024
 MAX_ARCHIVE_DEPTH = 3
 MAX_TRANSCRIPTION_FILENAME = 120
+
+# ----- Pastas/arquivos ignorados por padrão -----
+# Resultado de build, dependências instaladas e caches — nunca é o que se
+# quer mandar pra análise de código. Ativado por padrão, mas pode ser
+# desligado na UI (ou via use_default_ignores=False nas funções).
+DEFAULT_IGNORE_DIRS = {
+    '.git', '.svn', '.hg',
+    'node_modules', 'bower_components', '.pnpm-store',
+    '__pycache__', '.pytest_cache', '.mypy_cache', '.ruff_cache',
+    '.tox', '.nox',
+    '.venv', 'venv', 'env', 'virtualenv',
+    'dist', 'build', 'out', 'target', '.output',
+    '.next', '.nuxt', '.svelte-kit', '.angular', '.expo',
+    '.parcel-cache', '.turbo', '.cache', '.vite',
+    'coverage', '.nyc_output',
+    '.gradle', '.idea', '.vscode', '.vs',
+    'vendor', 'Pods', 'DerivedData', '.dart_tool',
+    '.terraform', '.serverless',
+    'site-packages', '.eggs',
+}
+DEFAULT_IGNORE_DIR_SUFFIXES = ('.egg-info',)
+
+DEFAULT_IGNORE_FILES = {
+    '.DS_Store', 'Thumbs.db', 'desktop.ini',
+    'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml',
+    'composer.lock', 'Cargo.lock', 'poetry.lock', 'Gemfile.lock',
+    'Pipfile.lock',
+}
+DEFAULT_IGNORE_FILE_SUFFIXES = ('.min.js', '.min.css', '.map', '.pyc', '.pyo')
+
+# ----- Arquivos claramente sensíveis -----
+# Nunca têm o conteúdo transcrito (mesmo com redact_secrets=True só isso já
+# bastaria pra não vazar) — aparecem como placeholder. A regex de segredos
+# ainda roda em todo o resto, pra pegar chave hardcoded em código normal.
+SENSITIVE_FILENAMES_EXACT = {
+    '.env', '.env.local', '.env.development', '.env.production', '.env.test',
+    '.env.staging', '.npmrc', '.netrc', '.pgpass', '.htpasswd',
+    'id_rsa', 'id_dsa', 'id_ecdsa', 'id_ed25519',
+    'credentials.json', 'service-account.json', 'firebase-adminsdk.json',
+}
+SENSITIVE_FILENAME_SUFFIXES = (
+    '.pem', '.key', '.pfx', '.p12', '.jks', '.keystore', '.asc', '.gpg', '.ppk',
+)
+
+
+def _eh_arquivo_sensivel(nome):
+    base = os.path.basename(nome).lower()
+    if base in SENSITIVE_FILENAMES_EXACT:
+        return True
+    return base.endswith(SENSITIVE_FILENAME_SUFFIXES)
+
+
+# ----- Segredos óbvios em conteúdo de texto -----
+# Heurística por regex — não é garantia de segurança total. Serve pra
+# reduzir o risco de mandar uma chave hardcoded pra uma IA de terceiros por
+# descuido. Sempre revise antes de compartilhar a saída.
+
+_SEGREDO_PLACEHOLDER = re.compile(
+    r'^(os\.environ|process\.env|getenv\(|os\.getenv|System\.getenv|ENV\[|'
+    r'import\.meta\.env|config\.|settings\.|\$\{|\{\{|<.*>|x{3,}|changeme|'
+    r'exemplo|example|placeholder|your[_-]?(api[_-]?)?key|redacted|'
+    r'none|null|true|false|\.\.\.)', re.IGNORECASE)
+
+
+def _mask_url_creds(m):
+    return f"{m.group(1)}{m.group(2)}:«OCULTADO»@"
+
+
+def _mask_kv(m):
+    valor = m.group(3)
+    if _SEGREDO_PLACEHOLDER.match(valor):
+        return m.group(0)
+    return f"{m.group(1)}{m.group(2)}«OCULTADO»{m.group(2)}{m.group(4)}"
+
+
+def _mask_bearer(m):
+    return f"{m.group(1)}«OCULTADO»"
+
+
+SECRET_RULES = [
+    ("AWS Access Key ID",
+     re.compile(r'\b(?:AKIA|ASIA)[0-9A-Z]{16}\b'),
+     lambda m: "«OCULTADO:AWS-KEY»"),
+    ("AWS Secret Access Key",
+     re.compile(r'(?i)(aws_secret_access_key\s*[=:]\s*["\']?)'
+                r'([A-Za-z0-9/+=]{40})(["\']?)'),
+     lambda m: f"{m.group(1)}«OCULTADO»{m.group(3)}"),
+    ("Google API Key",
+     re.compile(r'\bAIza[0-9A-Za-z_\-]{35}\b'),
+     lambda m: "«OCULTADO:GOOGLE-API-KEY»"),
+    ("Chave privada (PEM)",
+     re.compile(r'-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]+?'
+                r'-----END [A-Z0-9 ]*PRIVATE KEY-----'),
+     lambda m: "-----BEGIN PRIVATE KEY-----\n«OCULTADO»\n"
+               "-----END PRIVATE KEY-----"),
+    ("Slack token",
+     re.compile(r'\bxox[baprs]-[0-9A-Za-z\-]{10,}\b'),
+     lambda m: "«OCULTADO:SLACK-TOKEN»"),
+    ("GitHub token",
+     re.compile(r'\bgh[pousr]_[A-Za-z0-9]{36,255}\b'),
+     lambda m: "«OCULTADO:GITHUB-TOKEN»"),
+    ("Stripe key",
+     re.compile(r'\b(?:sk|rk)_(?:live|test)_[0-9A-Za-z]{10,99}\b'),
+     lambda m: "«OCULTADO:STRIPE-KEY»"),
+    ("JSON Web Token",
+     re.compile(r'\beyJ[A-Za-z0-9_-]{5,}\.eyJ[A-Za-z0-9_-]{5,}\.'
+                r'[A-Za-z0-9_-]{10,}\b'),
+     lambda m: "«OCULTADO:JWT»"),
+    ("Credenciais em URL",
+     re.compile(r'([a-zA-Z][a-zA-Z0-9+.\-]*://)([^\s:/@"\']+):'
+                r'([^\s:/@"\']+)@'),
+     _mask_url_creds),
+    ("Atribuição de segredo (chave=valor)",
+     re.compile(
+         r'(?im)^(\s*[\w.\[\]"\'-]*(?:secret|senha|password|passwd|token|'
+         r'api[_-]?key|access[_-]?key|private[_-]?key|credential|'
+         r'client[_-]?secret|auth[_-]?token)[\w.\[\]"\'-]*\s*[:=]\s*)'
+         r'(["\']?)([^\s"\'#,;]{4,})\2(.*)$'),
+     _mask_kv),
+    ("Cabeçalho Authorization Bearer",
+     re.compile(r'(?i)(authorization["\']?\s*[:=]\s*["\']?Bearer\s+)'
+                r'([A-Za-z0-9\-._~+/]{10,}=*)'),
+     _mask_bearer),
+]
+
+
+def ofuscar_segredos(texto, nome_arquivo=""):
+    """Substitui segredos óbvios por marcadores. Devolve (texto, qtd)."""
+    total = 0
+    for _nome, regex, mask in SECRET_RULES:
+        texto, n = regex.subn(mask, texto)
+        total += n
+    return texto, total
 
 
 class Colors:
@@ -206,6 +351,131 @@ def get_output_filename():
             print_info("Digite outro nome ou 'sair' para cancelar.")
         else:
             return n
+
+
+# ============================================
+# IGNORE / .gitignore
+# ============================================
+# Implementação simplificada do subset mais usado de .gitignore: comentários,
+# negação (!), âncora (/prefixo), "pasta apenas" (sufixo/), * ? [...] e **.
+# Não cobre 100% dos casos extremos do git real — é uma heurística pensada
+# pra reduzir ruído antes de mandar pra análise de IA, não uma reimplementação
+# do git.
+
+def _traduzir_padrao_gitignore(padrao):
+    i, n = 0, len(padrao)
+    partes = []
+    while i < n:
+        c = padrao[i]
+        if c == '*':
+            if padrao[i:i + 3] == '**/':
+                partes.append('(?:.*/)?')
+                i += 3
+            elif padrao[i:i + 2] == '**':
+                partes.append('.*')
+                i += 2
+            else:
+                partes.append('[^/]*')
+                i += 1
+        elif c == '?':
+            partes.append('[^/]')
+            i += 1
+        elif c == '[':
+            fim = padrao.find(']', i + 1)
+            if fim == -1:
+                partes.append(re.escape(c))
+                i += 1
+            else:
+                partes.append(padrao[i:fim + 1])
+                i = fim + 1
+        else:
+            partes.append(re.escape(c))
+            i += 1
+    return ''.join(partes)
+
+
+def _compilar_regra_gitignore(linha, base_dir):
+    linha = linha.rstrip('\n').rstrip('\r')
+    if not linha.strip() or linha.lstrip().startswith('#'):
+        return None
+    neg = linha.startswith('!')
+    if neg:
+        linha = linha[1:]
+    if linha.endswith('/'):
+        dir_only = True
+        linha = linha[:-1]
+    else:
+        dir_only = False
+    linha = linha.rstrip()
+    if not linha:
+        return None
+    ancorado = linha.startswith('/')
+    if ancorado:
+        linha = linha[1:]
+    tem_barra_interna = '/' in linha
+    corpo = _traduzir_padrao_gitignore(linha)
+    if ancorado or tem_barra_interna:
+        regex_str = '^' + corpo + '(?:/.*)?$'
+    else:
+        regex_str = '^(?:.*/)?' + corpo + '(?:/.*)?$'
+    try:
+        regex = re.compile(regex_str)
+    except re.error:
+        return None
+    return {'regex': regex, 'negate': neg, 'dir_only': dir_only, 'base': base_dir}
+
+
+def _carregar_gitignore(dir_path):
+    caminho = os.path.join(dir_path, '.gitignore')
+    regras = []
+    try:
+        with open(caminho, 'r', encoding='utf-8', errors='replace') as f:
+            for linha in f:
+                r = _compilar_regra_gitignore(linha, dir_path)
+                if r:
+                    regras.append(r)
+    except OSError:
+        pass
+    return regras
+
+
+def _compilar_padroes_extra(padroes, base_dir):
+    regras = []
+    for p in (padroes or []):
+        r = _compilar_regra_gitignore(p, base_dir)
+        if r:
+            regras.append(r)
+    return regras
+
+
+def _gitignore_bate(caminho_abs, is_dir, regras):
+    resultado = False
+    for regra in regras:
+        if regra['dir_only'] and not is_dir:
+            continue
+        try:
+            rel = os.path.relpath(caminho_abs, regra['base'])
+        except ValueError:
+            continue
+        rel = rel.replace(os.sep, '/')
+        if rel == '.' or rel.startswith('..'):
+            continue
+        if regra['regex'].match(rel):
+            resultado = not regra['negate']
+    return resultado
+
+
+def _item_ignorado(nome, caminho_abs, is_dir, usar_padrao, regras):
+    if usar_padrao:
+        if is_dir:
+            if nome in DEFAULT_IGNORE_DIRS or nome.endswith(DEFAULT_IGNORE_DIR_SUFFIXES):
+                return True, 'padrão'
+        else:
+            if nome in DEFAULT_IGNORE_FILES or nome.endswith(DEFAULT_IGNORE_FILE_SUFFIXES):
+                return True, 'padrão'
+    if regras and _gitignore_bate(caminho_abs, is_dir, regras):
+        return True, '.gitignore'
+    return False, None
 
 
 # ============================================
@@ -1434,7 +1704,7 @@ def _render_archive_tree(tree, prefix):
 def _processar_archive_recursivo(
         source, nome_original, chain, prefix, depth,
         archive_mode, archive_recurse, archive_max_depth,
-        max_lines, max_file_size, writer, stats, lines):
+        max_lines, max_file_size, redact_secrets, writer, stats, lines):
 
     handler = REGISTRY.escolher(source, nome_original)
     if handler is None:
@@ -1465,6 +1735,22 @@ def _processar_archive_recursivo(
     for nome, tamanho, is_dir in entradas:
         if is_dir:
             continue
+
+        if redact_secrets and _eh_arquivo_sensivel(nome):
+            stats['arquivos_sensiveis_ocultados'] += 1
+            placeholder = (f"[🔒 Arquivo sensível — conteúdo não "
+                           f"transcrito: {escape_md(os.path.basename(nome))}]")
+            logical = "::".join(chain + [nome])
+            if writer is not None:
+                caminho = writer.escrever(logical, placeholder)
+                if caminho:
+                    lines.append(f"{prefix}    🔒 `{escape_md(nome)}` → "
+                                 f"[ver]({caminho})")
+            else:
+                lines.append(f"{prefix}    🔒 `{escape_md(nome)}`: "
+                             f"{placeholder}")
+            continue
+
         try:
             dados = handler.ler(source, nome)
         except Exception:
@@ -1480,7 +1766,7 @@ def _processar_archive_recursivo(
             _processar_archive_recursivo(
                 io.BytesIO(dados), nome, chain + [nome], novo_pref + "    ",
                 depth + 1, archive_mode, archive_recurse, archive_max_depth,
-                max_lines, max_file_size, writer, stats, lines)
+                max_lines, max_file_size, redact_secrets, writer, stats, lines)
             continue
 
         ext = os.path.splitext(nome)[1].lower()
@@ -1507,6 +1793,10 @@ def _processar_archive_recursivo(
                 texto = ('\n'.join(todas[:max_lines])
                          + f"\n... (continuação, {max_lines} linhas mostradas)")
 
+        if redact_secrets:
+            texto, n_segredos = ofuscar_segredos(texto, nome)
+            stats['segredos_ofuscados'] += n_segredos
+
         logical = "::".join(chain + [nome])
         if writer is not None:
             caminho = writer.escrever(logical, texto)
@@ -1530,16 +1820,18 @@ def _processar_archive_recursivo(
 # ============================================
 
 def generate_tree_only(start_dir, output_file, max_depth=None,
-                       include_hidden=False):
+                       include_hidden=False, use_default_ignores=True,
+                       respect_gitignore=True, extra_ignore_patterns=None):
     start_dir = os.path.abspath(start_dir)
     if not os.path.isdir(start_dir):
         print_error(f"Diretório inválido: {start_dir}")
         return False
     abs_output = os.path.abspath(output_file)
-    stats = {'dirs': 0, 'files': 0}
+    stats = {'dirs': 0, 'files': 0, 'dirs_ignoradas': 0, 'arquivos_ignorados': 0}
     lines = []
     dir_name = os.path.basename(start_dir) or start_dir
     agora = _agora()
+    regras_extra = _compilar_padroes_extra(extra_ignore_patterns, start_dir)
 
     lines.append(f"# 📂 Estrutura de Diretórios: `{dir_name}`\n")
     lines.append(f"**Diretório raiz:** `{start_dir}`\n")
@@ -1549,7 +1841,7 @@ def generate_tree_only(start_dir, output_file, max_depth=None,
 
     visited = set()
 
-    def walk(d, prefix="", depth=0):
+    def walk(d, prefix="", depth=0, regras_git=None):
         nonlocal stats
         if max_depth is not None and depth > max_depth:
             return
@@ -1558,16 +1850,34 @@ def generate_tree_only(start_dir, output_file, max_depth=None,
             lines.append(f"{prefix}└── 🔗 (link circular — não expandido)")
             return
         visited.add(real)
+        regras_git = list(regras_git or [])
+        if respect_gitignore:
+            regras_git += _carregar_gitignore(d)
+        regras_combinadas = regras_git + regras_extra
         try:
             itens = sorted(os.listdir(d))
             if not include_hidden:
                 itens = [i for i in itens if not i.startswith('.')]
             dirs, files = [], []
+            ignorados_motivo = {}
             for it in itens:
                 full = os.path.join(d, it)
                 if os.path.abspath(full) == abs_output:
                     continue
-                (dirs if os.path.isdir(full) else files).append(it)
+                is_dir = os.path.isdir(full)
+                if is_dir:
+                    ignorado, motivo = _item_ignorado(
+                        it, full, True, use_default_ignores, regras_combinadas)
+                    if ignorado:
+                        ignorados_motivo[it] = motivo
+                    dirs.append(it)
+                else:
+                    ignorado, motivo = _item_ignorado(
+                        it, full, False, use_default_ignores, regras_combinadas)
+                    if ignorado:
+                        stats['arquivos_ignorados'] += 1
+                        continue
+                    files.append(it)
             ordenados = dirs + files
             for i, it in enumerate(ordenados):
                 ultimo = (i == len(ordenados) - 1)
@@ -1575,9 +1885,16 @@ def generate_tree_only(start_dir, output_file, max_depth=None,
                 conector = "└── " if ultimo else "├── "
                 nome_md = escape_md(it)
                 if os.path.isdir(full):
+                    motivo = ignorados_motivo.get(it)
+                    if motivo:
+                        lines.append(f"{prefix}{conector}📁 {nome_md}/ "
+                                     f"_(ignorado — {motivo})_")
+                        stats['dirs_ignoradas'] += 1
+                        continue
                     lines.append(f"{prefix}{conector}📁 {nome_md}/")
                     stats['dirs'] += 1
-                    walk(full, prefix + ("    " if ultimo else "│   "), depth + 1)
+                    walk(full, prefix + ("    " if ultimo else "│   "),
+                         depth + 1, regras_git)
                 else:
                     stats['files'] += 1
                     lines.append(f"{prefix}{conector}📄 {nome_md}")
@@ -1594,7 +1911,11 @@ def generate_tree_only(start_dir, output_file, max_depth=None,
     lines.append("---\n")
     lines.append("## 📊 Estatísticas\n")
     lines.append(f"- 📁 Subpastas: {stats['dirs']}")
-    lines.append(f"- 📄 Arquivos: {stats['files']}\n")
+    lines.append(f"- 📄 Arquivos: {stats['files']}")
+    if stats['dirs_ignoradas'] or stats['arquivos_ignorados']:
+        lines.append(f"- ⏭️ Pastas ignoradas: {stats['dirs_ignoradas']}")
+        lines.append(f"- ⏭️ Arquivos ignorados: {stats['arquivos_ignorados']}")
+    lines.append("")
     lines.append("---\n")
     lines.append(f"*Gerado em {agora}*")
 
@@ -1618,7 +1939,9 @@ def generate_tree_with_content(
         root_only=False, max_file_size=MAX_FILE_SIZE,
         archive_mode='skip',
         archive_recurse=False, archive_max_depth=MAX_ARCHIVE_DEPTH,
-        output_mode='inline', transcriptions_dir=None):
+        output_mode='inline', transcriptions_dir=None,
+        use_default_ignores=True, respect_gitignore=True,
+        extra_ignore_patterns=None, redact_secrets=True):
 
     start_dir = os.path.abspath(start_dir)
     if not os.path.isdir(start_dir):
@@ -1628,6 +1951,7 @@ def generate_tree_with_content(
     abs_output = os.path.abspath(output_file)
     out_dir = os.path.dirname(abs_output)
     stem = os.path.splitext(os.path.basename(abs_output))[0]
+    regras_extra = _compilar_padroes_extra(extra_ignore_patterns, start_dir)
 
     writer = None
     rel_dir_name = None
@@ -1649,6 +1973,8 @@ def generate_tree_with_content(
         'dirs': 0, 'files': 0, 'text_files': 0, 'transcribed': 0,
         'skipped': 0, 'errors': 0,
         'archives': 0, 'archive_members': 0, 'archive_files': 0,
+        'dirs_ignoradas': 0, 'arquivos_ignorados': 0,
+        'segredos_ofuscados': 0, 'arquivos_sensiveis_ocultados': 0,
     }
     lines = []
     dir_name = os.path.basename(start_dir) or start_dir
@@ -1666,11 +1992,22 @@ def generate_tree_with_content(
         lines.append(f"**🗜️ Containers:** {rot}{rec}\n")
     if output_mode == 'separate':
         lines.append(f"**📁 Transcrições em:** `{rel_dir_name}/`\n")
+    if use_default_ignores or respect_gitignore or regras_extra:
+        partes = []
+        if use_default_ignores:
+            partes.append("pastas padrão")
+        if respect_gitignore:
+            partes.append(".gitignore")
+        if regras_extra:
+            partes.append("padrões extra")
+        lines.append(f"**⏭️ Ignorando:** {', '.join(partes)}\n")
+    if redact_secrets:
+        lines.append("**🔒 Segredos:** ofuscados automaticamente\n")
     lines.append("---\n")
 
     visited = set()
 
-    def walk(d, prefix="", depth=0, is_root=True):
+    def walk(d, prefix="", depth=0, is_root=True, regras_git=None):
         nonlocal stats
         if max_depth is not None and depth > max_depth:
             return
@@ -1679,16 +2016,34 @@ def generate_tree_with_content(
             lines.append(f"{prefix}└── 🔗 **(link circular)**")
             return
         visited.add(real)
+        regras_git = list(regras_git or [])
+        if respect_gitignore:
+            regras_git += _carregar_gitignore(d)
+        regras_combinadas = regras_git + regras_extra
         try:
             itens = sorted(os.listdir(d))
             if not include_hidden:
                 itens = [i for i in itens if not i.startswith('.')]
             dirs, files = [], []
+            ignorados_motivo = {}
             for it in itens:
                 full = os.path.join(d, it)
                 if os.path.abspath(full) == abs_output:
                     continue
-                (dirs if os.path.isdir(full) else files).append(it)
+                is_dir = os.path.isdir(full)
+                if is_dir:
+                    ignorado, motivo = _item_ignorado(
+                        it, full, True, use_default_ignores, regras_combinadas)
+                    if ignorado:
+                        ignorados_motivo[it] = motivo
+                    dirs.append(it)
+                else:
+                    ignorado, motivo = _item_ignorado(
+                        it, full, False, use_default_ignores, regras_combinadas)
+                    if ignorado:
+                        stats['arquivos_ignorados'] += 1
+                        continue
+                    files.append(it)
             ordenados = dirs + files
             for i, it in enumerate(ordenados):
                 ultimo = (i == len(ordenados) - 1)
@@ -1698,9 +2053,15 @@ def generate_tree_with_content(
                 novo_prefix = prefix + ("    " if ultimo else "│   ")
 
                 if os.path.isdir(full):
+                    motivo = ignorados_motivo.get(it)
+                    if motivo:
+                        lines.append(f"{prefix}{conector}📁 **{nome_md}/** "
+                                     f"_(ignorado — {motivo})_")
+                        stats['dirs_ignoradas'] += 1
+                        continue
                     lines.append(f"{prefix}{conector}📁 **{nome_md}/**")
                     stats['dirs'] += 1
-                    walk(full, novo_prefix, depth + 1, False)
+                    walk(full, novo_prefix, depth + 1, False, regras_git)
                     continue
 
                 stats['files'] += 1
@@ -1730,7 +2091,8 @@ def generate_tree_with_content(
                         _processar_archive_recursivo(
                             full, it, [it], novo_prefix, 0,
                             archive_mode, archive_recurse, archive_max_depth,
-                            max_file_lines, max_file_size, writer, stats, lines)
+                            max_file_lines, max_file_size, redact_secrets,
+                            writer, stats, lines)
                         continue
 
                 is_txt = is_text_file(full)
@@ -1738,8 +2100,18 @@ def generate_tree_with_content(
                 if deve:
                     stats['text_files'] += 1
                     stats['transcribed'] += 1
-                    conteudo, erro = get_file_content(full, max_file_lines,
-                                                      max_file_size)
+                    if redact_secrets and _eh_arquivo_sensivel(it):
+                        stats['arquivos_sensiveis_ocultados'] += 1
+                        conteudo = ("[🔒 Arquivo sensível — conteúdo não "
+                                   "transcrito por padrão (contém "
+                                   "credenciais)]")
+                        erro = False
+                    else:
+                        conteudo, erro = get_file_content(full, max_file_lines,
+                                                          max_file_size)
+                        if not erro and redact_secrets:
+                            conteudo, n_segredos = ofuscar_segredos(conteudo, it)
+                            stats['segredos_ofuscados'] += n_segredos
                     if erro:
                         lines.append(f"{prefix}{conector}📄 **{nome_md}**"
                                      f"{size_str} — ⚠️")
@@ -1796,6 +2168,16 @@ def generate_tree_with_content(
             lines.append(f"- 🗜️ Membros de texto transcritos: "
                          f"{stats['archive_files']}")
     lines.append(f"- ⏭️ Ignorados (não-texto): {stats['skipped']}")
+    if stats['dirs_ignoradas'] or stats['arquivos_ignorados']:
+        lines.append(f"- ⏭️ Pastas ignoradas (ruído): {stats['dirs_ignoradas']}")
+        lines.append(f"- ⏭️ Arquivos ignorados (ruído): "
+                     f"{stats['arquivos_ignorados']}")
+    if stats['arquivos_sensiveis_ocultados']:
+        lines.append(f"- 🔒 Arquivos sensíveis ocultados: "
+                     f"{stats['arquivos_sensiveis_ocultados']}")
+    if stats['segredos_ofuscados']:
+        lines.append(f"- 🔒 Segredos ofuscados no conteúdo: "
+                     f"{stats['segredos_ofuscados']}")
     if stats['errors']:
         lines.append(f"- ❌ Erros: {stats['errors']}")
     if output_mode == 'separate':
@@ -1809,6 +2191,7 @@ def generate_tree_with_content(
     lines.append("- 📎 Arquivo binário")
     lines.append("- 🗜️ Container (zip, tar, img, deb, iso, boot, sparse, disk, ...)")
     lines.append("- 🔗 Link circular (não expandido)")
+    lines.append("- 🔒 Sensível/segredo ocultado")
     lines.append("")
     lines.append("---\n")
     lines.append(f"*Gerado em {agora}*")
@@ -1842,8 +2225,34 @@ def _mostrar_diagnostico():
     print()
 
 
+def _perguntar_ignorar(start_dir):
+    print_info("\nPasso 5: Ignorar pastas/arquivos (reduz ruído e tamanho)")
+    usar_padrao = get_input(
+        "Ignorar pastas e arquivos gerados automaticamente (node_modules, "
+        "dist, build, venv, __pycache__, .git, lockfiles, ...)?",
+        default=True, input_type=bool)
+    print_success("Pastas/arquivos padrão: ignorados" if usar_padrao
+                  else "Pastas/arquivos padrão: incluídos")
+
+    usar_gitignore = False
+    if os.path.isfile(os.path.join(start_dir, '.gitignore')):
+        usar_gitignore = get_input(
+            "Encontrei um .gitignore no diretório — respeitar as regras dele?",
+            default=True, input_type=bool)
+        print_success(".gitignore: respeitado" if usar_gitignore
+                      else ".gitignore: ignorado")
+
+    extra_str = get_input(
+        "Padrões extra para ignorar, separados por vírgula "
+        "(ex.: *.log, docs/rascunhos) — Enter = nenhum", default="")
+    extras = [p.strip() for p in extra_str.split(',') if p.strip()]
+    if extras:
+        print_success(f"Padrões extra: {', '.join(extras)}")
+    return usar_padrao, usar_gitignore, extras
+
+
 def _perguntar_archive():
-    print_info("\nPasso 8: Containers (zip, tar, img, deb, iso, apk, boot, sparse, ...)")
+    print_info("\nPasso 9: Containers (zip, tar, img, deb, iso, apk, boot, sparse, ...)")
     print("   [1] Ignorar (só aparecem como binário)")
     print("   [2] Apenas listar o conteúdo")
     print("   [3] Listar E transcrever os textos internos")
@@ -1914,6 +2323,8 @@ def _executar_uma_vez():
     include_hidden = get_input("Incluir ocultos?", default=False, input_type=bool)
     print_success("Sim" if include_hidden else "Não")
 
+    usar_ignore_padrao, usar_gitignore, extras_ignore = _perguntar_ignorar(start_dir)
+
     max_lines = None
     max_size_mb = 5
     root_only = False
@@ -1922,21 +2333,22 @@ def _executar_uma_vez():
     archive_max_depth = MAX_ARCHIVE_DEPTH
     output_mode = 'inline'
     trans_dir = None
+    redact_secrets = True
 
     if not modo_simples:
-        print_info("\nPasso 5: Limite de linhas por arquivo")
+        print_info("\nPasso 6: Limite de linhas por arquivo")
         li = get_input("Máximo de linhas (Enter = ilimitado)", default=None)
         max_lines = int(li) if li else None
         print_success(f"Linhas: {max_lines or 'Ilimitado'}")
 
-        print_info("\nPasso 6: Modo de transcrição")
+        print_info("\nPasso 7: Modo de transcrição")
         print("   [s] TODOS os arquivos de texto")
         print("   [n] APENAS arquivos da PASTA RAIZ")
         root_only = get_input("Apenas raiz? (s = raiz, n = todos)",
                               default=False, input_type=bool)
         print_success("Apenas raiz" if root_only else "Todos")
 
-        print_info("\nPasso 7: Tamanho máximo por arquivo (MB)")
+        print_info("\nPasso 8: Tamanho máximo por arquivo (MB)")
         si = get_input("Máximo (MB)", default=5)
         try:
             max_size_mb = float(si)
@@ -1949,6 +2361,14 @@ def _executar_uma_vez():
         (archive_mode, archive_recurse, archive_max_depth,
          output_mode, trans_dir) = _perguntar_archive()
 
+        print_info("\nPasso 10: Segurança")
+        redact_secrets = get_input(
+            "Ofuscar segredos (chaves de API, senhas, tokens, .env, chaves "
+            "privadas) nos arquivos transcritos?", default=True,
+            input_type=bool)
+        print_success("Segredos: ofuscados" if redact_secrets
+                      else "Segredos: NÃO ofuscados (cuidado!)")
+
     print_header("📋 RESUMO")
     print(f"{Colors.BOLD}Modo:{Colors.END} "
           f"{'Apenas Árvore' if modo_simples else 'Árvore + Transcrição'}")
@@ -1957,6 +2377,10 @@ def _executar_uma_vez():
     print(f"{Colors.BOLD}Profundidade:{Colors.END} {max_depth or 'Ilimitada'}")
     print(f"{Colors.BOLD}Ocultos:{Colors.END} "
           f"{'Sim' if include_hidden else 'Não'}")
+    print(f"{Colors.BOLD}Ignorar padrão:{Colors.END} "
+          f"{'Sim' if usar_ignore_padrao else 'Não'}")
+    print(f"{Colors.BOLD}.gitignore:{Colors.END} "
+          f"{'respeitado' if usar_gitignore else 'não usado'}")
     if not modo_simples:
         print(f"{Colors.BOLD}Linhas:{Colors.END} {max_lines or 'Ilimitado'}")
         print(f"{Colors.BOLD}Transcrição:{Colors.END} "
@@ -1970,6 +2394,8 @@ def _executar_uma_vez():
         if archive_mode == 'content':
             print(f"{Colors.BOLD}Saída das transcrições:{Colors.END} "
                   f"{'inline' if output_mode == 'inline' else 'separado'}")
+        print(f"{Colors.BOLD}Ofuscar segredos:{Colors.END} "
+              f"{'Sim' if redact_secrets else 'Não'}")
 
     print()
     if not get_input("🔄 Gerar com estas configurações?",
@@ -1979,8 +2405,11 @@ def _executar_uma_vez():
 
     print_header("🔄 GERANDO...")
     if modo_simples:
-        return generate_tree_only(start_dir, output_file, max_depth,
-                                  include_hidden)
+        return generate_tree_only(
+            start_dir, output_file, max_depth, include_hidden,
+            use_default_ignores=usar_ignore_padrao,
+            respect_gitignore=usar_gitignore,
+            extra_ignore_patterns=extras_ignore)
     return generate_tree_with_content(
         start_dir, output_file, max_depth, max_lines, include_hidden,
         root_only, max_file_size=max_size_mb * 1024 * 1024,
@@ -1988,12 +2417,16 @@ def _executar_uma_vez():
         archive_recurse=archive_recurse,
         archive_max_depth=archive_max_depth,
         output_mode=output_mode,
-        transcriptions_dir=trans_dir)
+        transcriptions_dir=trans_dir,
+        use_default_ignores=usar_ignore_padrao,
+        respect_gitignore=usar_gitignore,
+        extra_ignore_patterns=extras_ignore,
+        redact_secrets=redact_secrets)
 
 
 def main_interactive():
     os.system('cls' if os.name == 'nt' else 'clear')
-    print_header("🌳 TREE CONTENT GENERATOR - INTERATIVO (v6)")
+    print_header("🌳 TREE CONTENT GENERATOR - INTERATIVO (v7)")
     print(f"{Colors.BOLD}Bem-vindo!{Colors.END}\n")
     try:
         while True:

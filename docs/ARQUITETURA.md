@@ -122,6 +122,54 @@ Todos ajustáveis nas constantes no topo do script.
 
 ---
 
+## 3.1 Ignore (pastas padrão + .gitignore)
+
+Antes de decidir se um item do `os.listdir()` entra na árvore,
+`_item_ignorado()` é consultada. Ela combina três fontes, nessa ordem:
+
+~~~
+1. DEFAULT_IGNORE_DIRS / DEFAULT_IGNORE_FILES  (nome exato ou sufixo)
+2. Regras de .gitignore acumuladas (raiz → subpasta atual)
+3. Padrões extra informados pelo usuário (extra_ignore_patterns)
+~~~
+
+O `walk()` carrega o `.gitignore` de cada diretório que visita
+(`_carregar_gitignore`) e acumula as regras ao descer — exatamente como o
+git faz, com a simplificação de que não há meio-termo entre "regra bate" e
+"não bate" por diretório intermediário (não cobre o caso raro de um
+`.gitignore` filho tentar "designorar" algo que o pai baniu de forma
+ambígua). Cada padrão de `.gitignore` é traduzido pra regex por
+`_traduzir_padrao_gitignore()`, que entende `*`, `**`, `?`, `[...]`,
+âncora (`/`) e sufixo de pasta (`/`).
+
+Uma pasta ignorada aparece como uma linha só na árvore
+(`(ignorado — padrão)` ou `(ignorado — .gitignore)`) e **não é percorrida**
+— é isso que evita listar/ler os 50 mil arquivos de um `node_modules`.
+Arquivos ignorados simplesmente não aparecem (silenciosos), só contam nas
+estatísticas finais.
+
+## 3.2 Ofuscação de segredos
+
+Com `redact_secrets=True` (padrão), dois mecanismos agem antes de qualquer
+conteúdo ir pro `.md`:
+
+~~~
+1. _eh_arquivo_sensivel(nome)       → .env, id_rsa, *.pem, credentials.json, ...
+   Se bater: o conteúdo NUNCA é lido; vira um placeholder "🔒 sensível".
+2. ofuscar_segredos(texto)          → roda SECRET_RULES sobre o texto lido
+   Cada regra é (nome, regex, função_de_mascaramento); roda em sequência,
+   soma quantos matches cada uma teve.
+~~~
+
+As duas camadas aplicam-se tanto ao `walk()` principal quanto ao conteúdo
+lido de dentro de containers em `_processar_archive_recursivo()` — então um
+`.env` dentro de um `.zip` é tratado do mesmo jeito que um `.env` solto no
+disco. `SECRET_RULES` cobre chaves AWS/Google, tokens GitHub/Slack/Stripe,
+JWT, blocos PEM de chave privada, credenciais em URL, cabeçalho
+`Authorization: Bearer` e atribuições genéricas `CHAVE = valor` (com uma
+lista de *placeholders* conhecidos — `os.environ`, `<exemplo>`, etc. — pra
+não mascarar código que só *referencia* uma variável de ambiente).
+
 ## 4. Composição automática
 
 O truque bonito: os handlers **compõem** sozinhos porque a recursão é genérica.
