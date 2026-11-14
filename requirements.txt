@@ -57,6 +57,11 @@ py7zr>=0.21.0
 chardet>=5.2.0
 
 
+# ----- (Opcional) Respeitar o .gitignore com fidelidade -----
+# Sem ele, o .gitignore é lido por um fallback simples (sem negações '!').
+pathspec>=0.12.0
+
+
 # ----- (Opcional) Leitura de RAR sem o binário unrar -----
 # ATENÇÃO: rarfile precisa de um backend externo (unrar, unar ou
 # bsdtar) para extrair de fato. Ele só melhora o parsing da lista

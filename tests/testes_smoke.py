@@ -298,6 +298,94 @@ def t_generate_separate(mod, tmp):
     assert len(arquivos) >= 1, f"nenhum arquivo em {pasta}"
 
 
+def _criar_projeto_node(tmp):
+    """Projeto falso com lixo típico (node_modules, lock, .env, segredos)."""
+    raiz = tmp / "proj_filtro"
+    if raiz.exists():
+        shutil.rmtree(raiz)
+    (raiz / "src").mkdir(parents=True)
+    (raiz / "api").mkdir()
+    (raiz / "docs").mkdir()
+    (raiz / "node_modules" / "lodash").mkdir(parents=True)
+    (raiz / "dist").mkdir()
+    (raiz / "gerado").mkdir()
+    (raiz / "src" / "index.ts").write_text("export const ok = 1;\n")
+    (raiz / "api" / "server.py").write_text("print('api')\n")
+    (raiz / "docs" / "leia.md").write_text("# docs\n")
+    (raiz / "node_modules" / "lodash" / "index.js").write_text("module.exports={}\n")
+    (raiz / "dist" / "index.js").write_text("compilado\n")
+    (raiz / "gerado" / "x.txt").write_text("gerado\n")
+    (raiz / "package.json").write_text('{"name":"p"}\n')
+    (raiz / "package-lock.json").write_text('{"lockfileVersion":3}\n')
+    (raiz / ".env").write_text("SENHA=123\n")
+    (raiz / "chave.pem").write_text("-----BEGIN-----\n")
+    (raiz / "debug.log").write_text("log\n")
+    (raiz / ".gitignore").write_text("gerado/\n")
+    return raiz
+
+
+def _gerar(mod, raiz, tmp, nome, **kw):
+    out = tmp / nome
+    ok = mod.generate_tree_with_content(str(raiz), str(out), **kw)
+    assert ok, "generate_tree_with_content devolveu False"
+    return out.read_text(encoding="utf-8")
+
+
+def t_excludes_padrao(mod, tmp):
+    """node_modules, dist, lockfile, .env, .pem e .log ficam de fora."""
+    raiz = _criar_projeto_node(tmp)
+    md = _gerar(mod, raiz, tmp, "f1.md", include_hidden=True)
+    for ausente in ("node_modules", "dist/", "package-lock.json",
+                    "SENHA=123", "chave.pem", "debug.log"):
+        assert ausente not in md, f"{ausente!r} deveria estar fora"
+    for presente in ("index.ts", "server.py", "package.json"):
+        assert presente in md, f"{presente!r} deveria estar presente"
+
+
+def t_respeita_gitignore(mod, tmp):
+    """Pasta listada no .gitignore some; --no-gitignore traz de volta."""
+    raiz = _criar_projeto_node(tmp)
+    md = _gerar(mod, raiz, tmp, "f2.md")
+    assert "gerado" not in md, "gerado/ está no .gitignore"
+    filtro = mod.PathFilter(str(raiz), respect_gitignore=False)
+    md2 = _gerar(mod, raiz, tmp, "f3.md", path_filter=filtro)
+    assert "gerado" in md2, "sem gitignore, gerado/ deveria aparecer"
+
+
+def t_only_paths(mod, tmp):
+    """--only limita às pastas pedidas."""
+    raiz = _criar_projeto_node(tmp)
+    filtro = mod.PathFilter(str(raiz), only=["src", "api"])
+    md = _gerar(mod, raiz, tmp, "f4.md", path_filter=filtro)
+    assert "index.ts" in md and "server.py" in md
+    assert "leia.md" not in md, "docs/ não foi pedido"
+    assert "package.json" not in md, "arquivo da raiz não foi pedido"
+
+
+def t_exclude_extra(mod, tmp):
+    """Padrão extra via excludes funciona."""
+    raiz = _criar_projeto_node(tmp)
+    filtro = mod.PathFilter(str(raiz), excludes=["docs/", "*.py"])
+    md = _gerar(mod, raiz, tmp, "f5.md", path_filter=filtro)
+    assert "leia.md" not in md and "server.py" not in md
+    assert "index.ts" in md
+
+
+def t_cli_nao_interativo(mod, tmp):
+    """main_cli gera o arquivo sem pedir input()."""
+    raiz = _criar_projeto_node(tmp)
+    out = tmp / "cli.md"
+    antigo = builtins.input
+    builtins.input = _FakeInput([])  # qualquer input() quebra o teste
+    try:
+        rc = mod.main_cli([str(raiz), "-o", str(out), "--only", "src"])
+    finally:
+        builtins.input = antigo
+    assert rc == 0, f"rc={rc}"
+    md = out.read_text(encoding="utf-8")
+    assert "index.ts" in md and "server.py" not in md
+
+
 # ============================================================
 # REGISTRO DOS TESTES
 # ============================================================
@@ -319,6 +407,11 @@ TESTES = [
     ("valid_options é estrito",            t_valid_options_estrito),
     ("generate inline funciona",           t_generate_inline),
     ("generate separate cria pasta",       t_generate_separate),
+    ("excludes padrão (node_modules etc.)", t_excludes_padrao),
+    ("respeita .gitignore",                t_respeita_gitignore),
+    ("only limita pastas",                 t_only_paths),
+    ("exclude extra",                      t_exclude_extra),
+    ("CLI não interativo",                 t_cli_nao_interativo),
 ]
 
 

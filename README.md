@@ -175,6 +175,44 @@ sudo pacman -S p7zip android-tools e2fsprogs mtools cdrtools \
                squashfs-tools file unrar
 ~~~
 
+## 🤖 Modo não interativo (CLI)
+
+Com argumentos, o gerador roda direto, sem perguntas, ideal para scripts e
+pipelines. Sem argumentos, continua abrindo o modo interativo.
+
+~~~bash
+# Projeto inteiro, com as exclusões padrão e o .gitignore aplicados
+python3 geradordepastasearquivos.py ./meu-projeto -o contexto.md
+
+# Só algumas pastas
+python3 geradordepastasearquivos.py ./meu-projeto -o contexto.md --only src,api
+
+# Padrões extras e limites
+python3 geradordepastasearquivos.py . --exclude "docs/,*.snap" --max-lines 400
+~~~
+
+Flags: `--only`, `--exclude`, `--no-default-excludes`, `--no-gitignore`,
+`--hidden`, `--tree-only`, `--max-depth`, `--max-lines`, `--max-size` (MB),
+`--archives {skip,list,content}`, `--separate`.
+
+**Exclusões padrão** (`DEFAULT_EXCLUDES`, valem também no modo interativo):
+`node_modules/`, `dist/`, `build/`, `out/`, `coverage/`, `target/`, `venv/`,
+`env/`, `__pycache__/`, lockfiles (`*.lock`, `package-lock.json`,
+`pnpm-lock.yaml`, `yarn.lock`), `*.min.js`, `*.map`, `*.log`, bancos locais
+(`*.db`, `*.sqlite`) e segredos (`.env*`, `*.pem`, `*.key`, `*.p12`,
+`id_rsa*`, `*secret*`, `*credential*`, `.npmrc`, `.netrc`). O `.gitignore` da
+raiz também é respeitado (fiel com `pathspec`, ou por um fallback simples sem ele).
+
+Usando como biblioteca:
+
+~~~python
+from geradordepastasearquivos import PathFilter, generate_tree_with_content
+f = PathFilter("./proj", only=["src"], excludes=["*.snap"])
+generate_tree_with_content("./proj", "ctx.md", max_file_lines=400, path_filter=f)
+~~~
+
+---
+
 ## 📖 Uso detalhado
 
 ### Modo "só árvore"
