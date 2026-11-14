@@ -37,6 +37,8 @@ import bz2
 import gzip
 import io
 import lzma
+import argparse
+import fnmatch
 import os
 import shutil
 import stat
@@ -86,6 +88,112 @@ MAX_ARCHIVE_MEMBERS = 5000
 MAX_ARCHIVE_TOTAL_BYTES = 4 * 1024 * 1024
 MAX_ARCHIVE_DEPTH = 3
 MAX_TRANSCRIPTION_FILENAME = 120
+
+# Padrões ignorados por padrão (sintaxe estilo .gitignore simplificada):
+#   - "nome/"  → só pastas com esse nome, em qualquer nível
+#   - "*.ext"  → casa com o nome do arquivo/pasta (fnmatch)
+#   - "a/b"    → contém '/', casa com o caminho relativo à raiz
+DEFAULT_EXCLUDES = [
+    # Dependências, builds e caches
+    'node_modules/', 'bower_components/', 'jspm_packages/',
+    'dist/', 'build/', 'out/', 'coverage/', 'target/',
+    'venv/', 'env/', '__pycache__/', 'site-packages/', '*.egg-info/',
+    '*.pyc', '*.pyo', '*.class', '*.o', '*.so', '*.dll', '*.exe',
+    # Lockfiles e artefatos gerados (grandes e sem valor como contexto)
+    '*.lock', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock',
+    'npm-shrinkwrap.json', '*.min.js', '*.min.css', '*.map', '*.log',
+    '*.tsbuildinfo',
+    # Bancos locais
+    '*.sqlite', '*.sqlite3', '*.db',
+    # Segredos
+    '.env', '.env.*', '*.env', '*.pem', '*.key', '*.p12', '*.pfx',
+    '*.keystore', '*.jks', 'id_rsa*', 'id_ed25519*', '*secret*',
+    '*credential*', '.npmrc', '.pypirc', '.netrc',
+]
+
+
+def _ler_gitignore(start_dir):
+    """Lê o .gitignore da raiz. Devolve lista de linhas (pode ser vazia)."""
+    p = os.path.join(start_dir, '.gitignore')
+    try:
+        with open(p, 'r', encoding='utf-8', errors='replace') as f:
+            return [ln.rstrip('\n') for ln in f]
+    except OSError:
+        return []
+
+
+class PathFilter:
+    """Decide quais caminhos entram na árvore.
+
+    Combina: padrões de exclusão (DEFAULT_EXCLUDES + extras), o .gitignore
+    da raiz (via `pathspec`, se instalado; senão um fallback simples) e
+    uma lista opcional `only` de caminhos relativos permitidos.
+    """
+
+    def __init__(self, start_dir, excludes=None, use_defaults=True,
+                 respect_gitignore=True, only=None):
+        self.start_dir = os.path.abspath(start_dir)
+        pats = list(DEFAULT_EXCLUDES) if use_defaults else []
+        pats += [p.strip() for p in (excludes or []) if p and p.strip()]
+        self.patterns = pats
+        self.only = [os.path.normpath(o.strip().strip('/'))
+                     for o in (only or []) if o and o.strip().strip('/')]
+        self._spec = None
+        self._gi_fallback = []
+        if respect_gitignore:
+            linhas = _ler_gitignore(self.start_dir)
+            if linhas:
+                try:
+                    import pathspec
+                    self._spec = pathspec.PathSpec.from_lines(
+                        'gitwildmatch', linhas)
+                except ImportError:
+                    # Fallback: ignora negações e comentários
+                    self._gi_fallback = [
+                        ln.strip() for ln in linhas
+                        if ln.strip() and not ln.lstrip().startswith(('#', '!'))
+                    ]
+
+    @staticmethod
+    def _casa(pat, nome, rel, is_dir):
+        if pat.endswith('/'):
+            if not is_dir:
+                return False
+            pat = pat.rstrip('/')
+        ancorado = pat.startswith('/')
+        pat = pat.lstrip('/')
+        if '/' in pat or ancorado:
+            return fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(rel, pat + '/*')
+        return fnmatch.fnmatch(nome, pat)
+
+    def _dentro_de_only(self, rel, is_dir):
+        if not self.only:
+            return True
+        for o in self.only:
+            if rel == o or rel.startswith(o + os.sep):
+                return True  # dentro de uma pasta permitida
+            if is_dir and o.startswith(rel + os.sep):
+                return True  # ancestral de uma pasta permitida
+        return False
+
+    def permitido(self, full):
+        full = os.path.abspath(full)
+        rel = os.path.relpath(full, self.start_dir)
+        if rel == '.':
+            return True
+        nome = os.path.basename(full)
+        is_dir = os.path.isdir(full)
+        rel_posix = rel.replace(os.sep, '/')
+        for pat in self.patterns:
+            if self._casa(pat, nome, rel_posix, is_dir):
+                return False
+        if self._spec is not None:
+            if self._spec.match_file(rel_posix + ('/' if is_dir else '')):
+                return False
+        for pat in self._gi_fallback:
+            if self._casa(pat, nome, rel_posix, is_dir):
+                return False
+        return self._dentro_de_only(rel, is_dir)
 
 
 class Colors:
@@ -1530,11 +1638,13 @@ def _processar_archive_recursivo(
 # ============================================
 
 def generate_tree_only(start_dir, output_file, max_depth=None,
-                       include_hidden=False):
+                       include_hidden=False, path_filter=None):
     start_dir = os.path.abspath(start_dir)
     if not os.path.isdir(start_dir):
         print_error(f"Diretório inválido: {start_dir}")
         return False
+    if path_filter is None:
+        path_filter = PathFilter(start_dir)
     abs_output = os.path.abspath(output_file)
     stats = {'dirs': 0, 'files': 0}
     lines = []
@@ -1566,6 +1676,8 @@ def generate_tree_only(start_dir, output_file, max_depth=None,
             for it in itens:
                 full = os.path.join(d, it)
                 if os.path.abspath(full) == abs_output:
+                    continue
+                if not path_filter.permitido(full):
                     continue
                 (dirs if os.path.isdir(full) else files).append(it)
             ordenados = dirs + files
@@ -1618,12 +1730,14 @@ def generate_tree_with_content(
         root_only=False, max_file_size=MAX_FILE_SIZE,
         archive_mode='skip',
         archive_recurse=False, archive_max_depth=MAX_ARCHIVE_DEPTH,
-        output_mode='inline', transcriptions_dir=None):
+        output_mode='inline', transcriptions_dir=None, path_filter=None):
 
     start_dir = os.path.abspath(start_dir)
     if not os.path.isdir(start_dir):
         print_error(f"Diretório inválido: {start_dir}")
         return False
+    if path_filter is None:
+        path_filter = PathFilter(start_dir)
 
     abs_output = os.path.abspath(output_file)
     out_dir = os.path.dirname(abs_output)
@@ -1687,6 +1801,8 @@ def generate_tree_with_content(
             for it in itens:
                 full = os.path.join(d, it)
                 if os.path.abspath(full) == abs_output:
+                    continue
+                if not path_filter.permitido(full):
                     continue
                 (dirs if os.path.isdir(full) else files).append(it)
             ordenados = dirs + files
@@ -2017,7 +2133,69 @@ def main_interactive():
     print("=" * 60 + "\n")
 
 
+def _lista_csv(valores):
+    """Aceita '--x a,b --x c' e devolve ['a', 'b', 'c']."""
+    out = []
+    for v in valores or []:
+        out += [p.strip() for p in v.split(',') if p.strip()]
+    return out
+
+
+def build_arg_parser():
+    ap = argparse.ArgumentParser(
+        prog="geradordepastasearquivos.py",
+        description="Gera um .md com a árvore e o conteúdo de uma pasta. "
+                    "Sem argumentos, abre o modo interativo.")
+    ap.add_argument("dir", help="Pasta a percorrer")
+    ap.add_argument("-o", "--output", default="estrutura_completa.md",
+                    help="Arquivo .md de saída (padrão: %(default)s)")
+    ap.add_argument("--only", action="append", metavar="PASTAS",
+                    help="Só inclui estes caminhos relativos (vírgula ou repetido)")
+    ap.add_argument("--exclude", action="append", metavar="PADRÕES",
+                    help="Padrões extras a ignorar (estilo .gitignore)")
+    ap.add_argument("--no-default-excludes", action="store_true",
+                    help="Não aplica a lista DEFAULT_EXCLUDES")
+    ap.add_argument("--no-gitignore", action="store_true",
+                    help="Não respeita o .gitignore da raiz")
+    ap.add_argument("--hidden", action="store_true",
+                    help="Inclui arquivos/pastas ocultos")
+    ap.add_argument("--tree-only", action="store_true",
+                    help="Só a árvore, sem conteúdo")
+    ap.add_argument("--max-depth", type=int, default=None)
+    ap.add_argument("--max-lines", type=int, default=None,
+                    help="Máximo de linhas transcritas por arquivo")
+    ap.add_argument("--max-size", type=float, default=5,
+                    help="Tamanho máximo por arquivo, em MB (padrão: 5)")
+    ap.add_argument("--archives", choices=["skip", "list", "content"],
+                    default="skip", help="O que fazer com containers")
+    ap.add_argument("--separate", action="store_true",
+                    help="Transcrições em pasta separada em vez de inline")
+    return ap
+
+
+def main_cli(argv):
+    a = build_arg_parser().parse_args(argv)
+    filtro = PathFilter(
+        a.dir, excludes=_lista_csv(a.exclude),
+        use_defaults=not a.no_default_excludes,
+        respect_gitignore=not a.no_gitignore,
+        only=_lista_csv(a.only))
+    if a.tree_only:
+        ok = generate_tree_only(a.dir, a.output, a.max_depth, a.hidden,
+                                path_filter=filtro)
+    else:
+        ok = generate_tree_with_content(
+            a.dir, a.output, a.max_depth, a.max_lines, a.hidden,
+            max_file_size=int(a.max_size * 1024 * 1024),
+            archive_mode=a.archives,
+            output_mode='separate' if a.separate else 'inline',
+            path_filter=filtro)
+    return 0 if ok else 1
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        sys.exit(main_cli(sys.argv[1:]))
     try:
         main_interactive()
     except KeyboardInterrupt:
